@@ -351,7 +351,7 @@ static int xiic_wait_tx_empty(struct xiic_i2c *i2c)
 	return 0;
 }
 
-static int xiic_reinit(struct xiic_i2c *i2c)
+static int xiic_reinit(struct xiic_i2c *i2c, bool atomic)
 {
 	int ret;
 
@@ -376,10 +376,17 @@ static int xiic_reinit(struct xiic_i2c *i2c)
 	if (ret)
 		return ret;
 
+	if (atomic) {
+		/* Disable interrupts */
+		xiic_setreg32(i2c, XIIC_DGIER_OFFSET, 0);
+
+		xiic_irq_clr(i2c, XIIC_INTR_ARB_LOST_MASK);
+	} else {
 	/* Enable interrupts */
 	xiic_setreg32(i2c, XIIC_DGIER_OFFSET, XIIC_GINTR_ENABLE_MASK);
 
 	xiic_irq_clr_en(i2c, XIIC_INTR_ARB_LOST_MASK);
+	}
 
 	return 0;
 }
@@ -650,7 +657,7 @@ static irqreturn_t xiic_process(int irq, void *dev_id)
 		 * fifos and the next message is a TX with len 0 (only addr)
 		 * reset the IP instead of just flush fifos
 		 */
-		ret = xiic_reinit(i2c);
+		ret = xiic_reinit(i2c, false);
 		if (!ret)
 			dev_dbg(i2c->adap.dev.parent, "reinit failed\n");
 
@@ -774,7 +781,7 @@ static int xiic_bus_busy(struct xiic_i2c *i2c)
 	return (sr & XIIC_SR_BUS_BUSY_MASK) ? -EBUSY : 0;
 }
 
-static int xiic_busy(struct xiic_i2c *i2c)
+static int xiic_busy(struct xiic_i2c *i2c, bool atomic)
 {
 	int tries = 3;
 	int err;
@@ -797,7 +804,11 @@ static int xiic_busy(struct xiic_i2c *i2c)
 	 */
 	err = xiic_bus_busy(i2c);
 	while (err && tries--) {
+		if (atomic) {
+			udelay(1000);
+		} else {
 		msleep(1);
+		}
 		err = xiic_bus_busy(i2c);
 	}
 
@@ -1080,7 +1091,7 @@ static int xiic_start_xfer(struct xiic_i2c *i2c)
 
 	mutex_lock(&i2c->lock);
 
-	ret = xiic_reinit(i2c);
+	ret = xiic_reinit(i2c, false);
 	if (!ret)
 		__xiic_start_xfer(i2c);
 
@@ -1106,7 +1117,7 @@ static int xiic_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 	if (err < 0)
 		return err;
 
-	err = xiic_busy(i2c);
+	err = xiic_busy(i2c, false);
 	if (err)
 		goto out;
 
@@ -1396,7 +1407,7 @@ static int xiic_i2c_probe(struct platform_device *pdev)
 	if (!(sr & XIIC_SR_TX_FIFO_EMPTY_MASK))
 		i2c->endianness = BIG;
 
-	ret = xiic_reinit(i2c);
+	ret = xiic_reinit(i2c, false);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "Cannot xiic_reinit\n");
 		goto err_clk_dis;
