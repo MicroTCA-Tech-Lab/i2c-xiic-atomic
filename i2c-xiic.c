@@ -30,8 +30,12 @@
 #include <linux/of.h>
 #include <linux/clk.h>
 #include <linux/pm_runtime.h>
+#include <linux/version.h>
 
 #define DRIVER_NAME "xiic-i2c"
+
+#define FREQ_CONF_ENABLED (LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0))
+#define NEW_PM_RUNTIME (LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,11))
 
 #define DYNAMIC_MODE_READ_BROKEN_BIT	BIT(0)
 
@@ -88,14 +92,17 @@ struct xiic_i2c {
 	bool prev_msg_tx;
 	bool smbus_block_read;
 	u32 quirks;
+#if FREQ_CONF_ENABLED
 	unsigned long input_clk;
 	unsigned int i2c_clk;
+#endif
 };
 
 struct xiic_version_data {
 	u32 quirks;
 };
 
+#if FREQ_CONF_ENABLED
 /**
  * struct timing_regs - AXI I2C timing registers that depend on I2C spec
  * @tsusta: setup time for a repeated START condition
@@ -111,6 +118,7 @@ struct timing_regs {
 	unsigned int tsudat;
 	unsigned int tbuf;
 };
+#endif
 
 #define XIIC_MSB_OFFSET 0
 #define XIIC_REG_OFFSET (0x100 + XIIC_MSB_OFFSET)
@@ -221,7 +229,9 @@ struct timing_regs {
 
 static int xiic_start_xfer(struct xiic_i2c *i2c);
 static void __xiic_start_xfer(struct xiic_i2c *i2c);
+#if FREQ_CONF_ENABLED
 static int xiic_setclk(struct xiic_i2c *i2c);
+#endif
 
 /*
  * For the register read and write functions, a little-endian and big-endian
@@ -347,10 +357,11 @@ static int xiic_reinit(struct xiic_i2c *i2c)
 
 	xiic_setreg32(i2c, XIIC_RESETR_OFFSET, XIIC_RESET_MASK);
 
+#if FREQ_CONF_ENABLED
 	ret = xiic_setclk(i2c);
 	if (ret)
 		return ret;
-
+#endif
 	/* Set receive Fifo depth to maximum (zero based). */
 	xiic_setreg8(i2c, XIIC_RFD_REG_OFFSET, IIC_RX_FIFO_DEPTH - 1);
 
@@ -1087,7 +1098,11 @@ static int xiic_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 	dev_dbg(adap->dev.parent, "%s entry SR: 0x%x\n", __func__,
 		xiic_getreg8(i2c, XIIC_SR_REG_OFFSET));
 
+#if NEW_PM_RUNTIME
 	err = pm_runtime_resume_and_get(i2c->dev);
+#else
+	err = pm_runtime_get_sync(i2c->dev);
+#endif
 	if (err < 0)
 		return err;
 
@@ -1178,6 +1193,7 @@ static const struct of_device_id xiic_of_match[] = {
 MODULE_DEVICE_TABLE(of, xiic_of_match);
 #endif
 
+#if FREQ_CONF_ENABLED
 enum i2c_scl_freq {
 	REG_VALUES_100KHZ = 0,
 	REG_VALUES_400KHZ = 1,
@@ -1276,6 +1292,7 @@ static int xiic_setclk(struct xiic_i2c *i2c)
 
 	return 0;
 }
+#endif
 
 static int xiic_i2c_probe(struct platform_device *pdev)
 {
@@ -1322,9 +1339,17 @@ static int xiic_i2c_probe(struct platform_device *pdev)
 	init_waitqueue_head(&i2c->wait);
 
 	i2c->clk = devm_clk_get(&pdev->dev, NULL);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
 	if (IS_ERR(i2c->clk))
 		return dev_err_probe(&pdev->dev, PTR_ERR(i2c->clk),
 				     "input clock not found.\n");
+#else
+	if (IS_ERR(i2c->clk)) {
+		if (PTR_ERR(i2c->clk) != -EPROBE_DEFER)
+			dev_err(&pdev->dev, "input clock not found.\n");
+		return PTR_ERR(i2c->clk);
+	}
+#endif
 
 	ret = clk_prepare_enable(i2c->clk);
 	if (ret) {
@@ -1337,6 +1362,7 @@ static int xiic_i2c_probe(struct platform_device *pdev)
 	pm_runtime_set_active(i2c->dev);
 	pm_runtime_enable(i2c->dev);
 
+#if FREQ_CONF_ENABLED
 	/* SCL frequency configuration */
 	i2c->input_clk = clk_get_rate(i2c->clk);
 	ret = of_property_read_u32(pdev->dev.of_node, "clock-frequency",
@@ -1344,6 +1370,7 @@ static int xiic_i2c_probe(struct platform_device *pdev)
 	/* If clock-frequency not specified in DT, do not configure in SW */
 	if (ret || i2c->i2c_clk > I2C_MAX_FAST_MODE_PLUS_FREQ)
 		i2c->i2c_clk = 0;
+#endif
 
 	ret = devm_request_threaded_irq(&pdev->dev, irq, xiic_isr,
 					xiic_process, IRQF_ONESHOT,
@@ -1388,8 +1415,10 @@ static int xiic_i2c_probe(struct platform_device *pdev)
 			i2c_new_client_device(&i2c->adap, pdata->devices + i);
 	}
 
+#if FREQ_CONF_ENABLED
 	dev_dbg(&pdev->dev, "mmio %08lx irq %d scl clock frequency %d\n",
 		(unsigned long)res->start, irq, i2c->i2c_clk);
+#endif
 
 	return 0;
 
@@ -1408,7 +1437,11 @@ static int xiic_i2c_remove(struct platform_device *pdev)
 	/* remove adapter & data */
 	i2c_del_adapter(&i2c->adap);
 
+#if NEW_PM_RUNTIME
 	ret = pm_runtime_resume_and_get(i2c->dev);
+#else
+	ret = pm_runtime_get_sync(i2c->dev);
+#endif
 	if (ret < 0)
 		return ret;
 
