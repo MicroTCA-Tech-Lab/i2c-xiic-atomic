@@ -382,10 +382,10 @@ static int xiic_reinit(struct xiic_i2c *i2c, bool atomic)
 
 		xiic_irq_clr(i2c, XIIC_INTR_ARB_LOST_MASK);
 	} else {
-	/* Enable interrupts */
-	xiic_setreg32(i2c, XIIC_DGIER_OFFSET, XIIC_GINTR_ENABLE_MASK);
+		/* Enable interrupts */
+		xiic_setreg32(i2c, XIIC_DGIER_OFFSET, XIIC_GINTR_ENABLE_MASK);
 
-	xiic_irq_clr_en(i2c, XIIC_INTR_ARB_LOST_MASK);
+		xiic_irq_clr_en(i2c, XIIC_INTR_ARB_LOST_MASK);
 	}
 
 	return 0;
@@ -807,7 +807,7 @@ static int xiic_busy(struct xiic_i2c *i2c, bool atomic)
 		if (atomic) {
 			udelay(1000);
 		} else {
-		msleep(1);
+			msleep(1);
 		}
 		err = xiic_bus_busy(i2c);
 	}
@@ -1175,6 +1175,178 @@ out:
 	return err;
 }
 
+int wait_for_bit_atomic(struct xiic_i2c *priv,
+                        int offs,
+                        uint8_t mask,
+                        bool wait_for_bit_set,
+                        uint16_t timeout_ms)
+{
+	uint8_t val = 0;
+	while (timeout_ms--) {
+		val = xiic_getreg8(priv, offs);
+		if (((val & mask) != 0) == wait_for_bit_set) {
+			return 0;
+		}
+		udelay(1000);
+	}
+	dev_warn(priv->adap.dev.parent, 
+	         "%s: failed (%02x @ %04x)\n", __func__, val, offs);
+	return -1;
+}
+
+static void xiic_set_addr_atomic(struct i2c_adapter *adap, struct i2c_msg *msg,
+                                 u32 nmsgs)
+{
+	struct xiic_i2c *i2c = i2c_get_adapdata(adap);
+
+	xiic_irq_clr(i2c, XIIC_INTR_TX_ERROR_MASK);
+
+	if (!(msg->flags & I2C_M_NOSTART)) {
+		/* write the address */
+		u16 data = i2c_8bit_addr_from_msg(msg) | XIIC_TX_DYN_START_MASK;
+		if (nmsgs == 1 && msg->len == 0)
+			/* no data and last message -> add STOP */
+			data |= XIIC_TX_DYN_STOP_MASK;
+		xiic_setreg16(i2c, XIIC_DTR_REG_OFFSET, data);
+	}
+}
+
+static int xiic_read_rx_atomic(struct xiic_i2c *priv,
+                               struct i2c_msg *msg, int nmsgs)
+{
+	u8 bytes_in_fifo;
+	u32 pos = 0;
+	int i, ret;
+
+	while (pos < msg->len) {
+		ret = wait_for_bit_atomic(priv, XIIC_SR_REG_OFFSET,
+				                  XIIC_SR_RX_FIFO_EMPTY_MASK, false,
+				                  1000);
+		if (ret)
+			return ret;
+
+		bytes_in_fifo = xiic_getreg8(priv, XIIC_RFO_REG_OFFSET) + 1;
+
+		if (bytes_in_fifo > msg->len)
+			bytes_in_fifo = msg->len;
+
+		for (i = 0; i < bytes_in_fifo; i++) {
+			msg->buf[pos++] = xiic_getreg8(priv, XIIC_DRR_REG_OFFSET);
+		}
+	}
+
+	return 0;
+}
+
+static int xiic_read_atomic(struct i2c_adapter *adap, struct i2c_msg *msg,
+			     int nmsgs)
+{
+	struct xiic_i2c *i2c = i2c_get_adapdata(adap);
+	u8 rx_watermark, bytes;
+
+	xiic_irq_clr(i2c, XIIC_INTR_RX_FULL_MASK | XIIC_INTR_TX_ERROR_MASK);
+
+	/*
+	 * We want to get all but last byte, because the TX_ERROR IRQ
+	 * is used to indicate error ACK on the address, and
+	 * negative ack on the last received byte, so to not mix
+	 * them receive all but last.
+	 * In the case where there is only one byte to receive
+	 * we can check if ERROR and RX full is set at the same time
+	 */
+	rx_watermark = msg->len;
+	bytes = min_t(u8, rx_watermark, IIC_RX_FIFO_DEPTH);
+	bytes--;
+
+	xiic_setreg8(i2c, XIIC_RFD_REG_OFFSET, bytes);
+
+	xiic_set_addr_atomic(adap, msg, nmsgs);
+
+	xiic_irq_clr(i2c, XIIC_INTR_BNB_MASK);
+
+	xiic_setreg16(i2c, XIIC_DTR_REG_OFFSET,
+	              (msg->len & 0xff) | ((nmsgs == 1) ? XIIC_TX_DYN_STOP_MASK : 0));
+
+	if (nmsgs == 1)
+		/* very last, enable bus not busy as well */
+		xiic_irq_clr(i2c, XIIC_INTR_BNB_MASK);
+
+	return xiic_read_rx_atomic(i2c, msg, nmsgs);
+}
+
+
+static int xiic_write_atomic(struct i2c_adapter *adap, struct i2c_msg *msg, int nmsgs)
+{
+	struct xiic_i2c *i2c = i2c_get_adapdata(adap);
+	int ret = 0;
+
+	dev_dbg(adap->dev.parent, "%s: %d msgs\n", __func__, nmsgs);
+
+	xiic_set_addr_atomic(adap, msg, nmsgs);
+	i2c->tx_msg = msg;
+	i2c->tx_pos = 0;
+	i2c->nmsgs = nmsgs;
+	xiic_fill_tx_fifo(i2c);
+
+	ret = wait_for_bit_atomic(i2c, XIIC_SR_REG_OFFSET,
+			                  XIIC_SR_TX_FIFO_EMPTY_MASK, true, 1000);
+	if (ret)
+		return ret;
+
+	/* Clear any pending Tx empty, Tx Error and then enable them. */
+	xiic_irq_clr(i2c, XIIC_INTR_TX_EMPTY_MASK | XIIC_INTR_TX_ERROR_MASK |
+				   XIIC_INTR_BNB_MASK);
+
+	i2c->tx_msg = NULL;
+	return ret;
+}
+
+static int xiic_xfer_atomic(struct i2c_adapter *adap, struct i2c_msg *msg,
+			    int num)
+{
+	struct xiic_i2c *i2c = i2c_get_adapdata(adap);
+	int err, count;
+
+	dev_dbg(adap->dev.parent, "%s entry SR: 0x%x\n", __func__,
+	        xiic_getreg8(i2c, XIIC_SR_REG_OFFSET));
+
+#if NEW_PM_RUNTIME
+	err = pm_runtime_resume_and_get(i2c->dev);
+#else
+	err = pm_runtime_get_sync(i2c->dev);
+#endif
+	if (err < 0)
+		return err;
+
+	err = xiic_busy(i2c, true);
+	if (err)
+		goto out;
+
+	xiic_reinit(i2c, true);
+
+	count = 0;
+	for (; num > 0; num--, msg++) {
+		if (msg->flags & I2C_M_RD) {
+			err = xiic_read_atomic(adap, msg, num);
+		} else {
+			err = xiic_write_atomic(adap, msg, num);
+		}
+
+		if (err)
+			return -EREMOTEIO;
+
+		count++;
+	}
+	err = count;
+
+	pm_runtime_mark_last_busy(i2c->dev);
+	pm_runtime_put_autosuspend(i2c->dev);
+out:
+	dev_dbg(adap->dev.parent, "%s exit SR: 0x%x, returncode: %d\n", __func__,
+	        xiic_getreg8(i2c, XIIC_SR_REG_OFFSET), err);
+	return err;
+}
+
 static u32 xiic_func(struct i2c_adapter *adap)
 {
 	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL | I2C_FUNC_SMBUS_BLOCK_DATA;
@@ -1182,6 +1354,7 @@ static u32 xiic_func(struct i2c_adapter *adap)
 
 static const struct i2c_algorithm xiic_algorithm = {
 	.master_xfer = xiic_xfer,
+	.master_xfer_atomic = xiic_xfer_atomic,
 	.functionality = xiic_func,
 };
 
