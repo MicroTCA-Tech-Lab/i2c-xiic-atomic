@@ -1519,7 +1519,8 @@ static int xiic_i2c_probe(struct platform_device *pdev)
 	i2c->adap.dev.of_node = pdev->dev.of_node;
 
 	/* set the name of the controller */
-	if (!of_property_read_string(pdev->dev.of_node, "name", &of_name)) {
+	if (!of_property_read_string(pdev->dev.of_node, "name", &of_name)
+		&& strcmp(of_name, "i2c")) {
 		snprintf(i2c->adap.name, sizeof(i2c->adap.name),
 				 DRIVER_NAME " [%s]", of_name);
 	} else {
