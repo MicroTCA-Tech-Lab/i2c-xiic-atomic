@@ -1487,6 +1487,7 @@ static int xiic_i2c_probe(struct platform_device *pdev)
 	int ret, irq;
 	u8 i;
 	u32 sr;
+	const char *of_name = NULL;
 
 	i2c = devm_kzalloc(&pdev->dev, sizeof(*i2c), GFP_KERNEL);
 	if (!i2c)
@@ -1516,8 +1517,17 @@ static int xiic_i2c_probe(struct platform_device *pdev)
 	i2c_set_adapdata(&i2c->adap, i2c);
 	i2c->adap.dev.parent = &pdev->dev;
 	i2c->adap.dev.of_node = pdev->dev.of_node;
-	snprintf(i2c->adap.name, sizeof(i2c->adap.name),
-		 DRIVER_NAME " %s", pdev->name);
+
+	/* set the name of the controller */
+	if (!of_property_read_string(pdev->dev.of_node, "name", &of_name)) {
+		snprintf(i2c->adap.name, sizeof(i2c->adap.name),
+				 DRIVER_NAME " [%s]", of_name);
+	} else {
+		dev_warn(&pdev->dev, "could not find the name in the DT, "
+							 "using the default value\n");
+		snprintf(i2c->adap.name, sizeof(i2c->adap.name),
+		 		 DRIVER_NAME " %s", pdev->name);
+	}
 
 	mutex_init(&i2c->lock);
 	init_waitqueue_head(&i2c->wait);
